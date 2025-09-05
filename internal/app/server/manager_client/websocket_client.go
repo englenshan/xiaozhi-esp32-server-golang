@@ -10,11 +10,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/spf13/viper"
 
 	"xiaozhi-esp32-server-golang/internal/domain/mcp"
 	log "xiaozhi-esp32-server-golang/logger"
 )
+
+type MessageHandleFunc func(*WebSocketRequest) (string, error)
 
 type WebSocketClient struct {
 	conn           *websocket.Conn
@@ -28,6 +31,8 @@ type WebSocketClient struct {
 	connectMu      sync.Mutex
 	messageQueue   chan *WebSocketRequest
 	workers        sync.WaitGroup
+
+	messageHandle cmap.ConcurrentMap[string, MessageHandleFunc]
 }
 
 type WebSocketRequest struct {
@@ -70,6 +75,7 @@ func NewWebSocketClient() *WebSocketClient {
 		responseChans:  make(map[string]chan *WebSocketResponse),
 		callbacks:      make(map[string]func(*WebSocketResponse)),
 		messageQueue:   make(chan *WebSocketRequest, 100),
+		messageHandle:  cmap.New[MessageHandleFunc](),
 	}
 }
 
@@ -475,6 +481,10 @@ func (c *WebSocketClient) handleIncomingRequest(rawMessage map[string]interface{
 	}
 }
 
+func (c *WebSocketClient) RegisterMessageHandler(path string, handler MessageHandleFunc) {
+	c.messageHandle.Set(path, handler)
+}
+
 // handleDefaultRequest 默认请求处理器
 func (c *WebSocketClient) handleDefaultRequest(request *WebSocketRequest) {
 	switch request.Path {
@@ -505,13 +515,33 @@ func (c *WebSocketClient) handleDefaultRequest(request *WebSocketRequest) {
 		if err := c.SendResponse(request.ID, 200, response, ""); err != nil {
 			log.Errorf("发送ping响应失败: %v", err)
 		}
-
 	default:
-		log.Warnf("收到未知的WebSocket请求路径: %s, ID: %s", request.Path, request.ID)
+		handler, exists := c.messageHandle.Get(request.Path)
+		if exists {
+			// 调用处理器并处理返回值
+			result, err := handler(request)
+			if err != nil {
+				log.Errorf("处理请求 %s 失败: %v", request.Path, err)
+				// 发送错误响应
+				if err := c.SendResponse(request.ID, 500, nil, err.Error()); err != nil {
+					log.Errorf("发送错误响应失败: %v", err)
+				}
+			} else {
+				// 发送成功响应
+				response := map[string]interface{}{
+					"result": result,
+				}
+				if err := c.SendResponse(request.ID, 200, response, ""); err != nil {
+					log.Errorf("发送成功响应失败: %v", err)
+				}
+			}
+		} else {
+			log.Warnf("收到未知的WebSocket请求路径: %s, ID: %s", request.Path, request.ID)
 
-		// 发送404响应
-		if err := c.SendResponse(request.ID, 404, nil, "Unknown endpoint"); err != nil {
-			log.Errorf("发送错误响应失败: %v", err)
+			// 发送404响应
+			if err := c.SendResponse(request.ID, 404, nil, "Unknown endpoint"); err != nil {
+				log.Errorf("发送错误响应失败: %v", err)
+			}
 		}
 	}
 }

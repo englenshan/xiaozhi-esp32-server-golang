@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -17,7 +18,51 @@ type UserController struct {
 	DB                  *gorm.DB
 	WebSocketController interface {
 		RequestMcpToolsFromClient(ctx context.Context, agentID string) ([]string, error)
+		InjectMessageToDevice(ctx context.Context, deviceID, message string, skipLlm bool) error
 	}
+}
+
+// 注入消息到设备
+func (uc *UserController) InjectMessage(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	var req struct {
+		DeviceID string `json:"device_id" binding:"required"`
+		Message  string `json:"message" binding:"required"`
+		SkipLlm  bool   `json:"skip_llm"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+
+	// 验证设备是否属于当前用户
+	var device models.Device
+
+	if err := uc.DB.Where("device_name = ? AND user_id = ?", req.DeviceID, userID).First(&device).Error; err != nil {
+		log.Printf("[InjectMessage] 设备查询失败: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "设备不存在或不属于当前用户"})
+		return
+	}
+
+	// 通过WebSocket发送消息注入请求到主服务器
+	ctx := context.Background()
+	err := uc.WebSocketController.InjectMessageToDevice(ctx, device.DeviceName, req.Message, req.SkipLlm)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "消息注入失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "消息注入请求已发送",
+		"data": gin.H{
+			"device_id": req.DeviceID,
+			"message":   req.Message,
+			"skip_llm":  req.SkipLlm,
+		},
+	})
 }
 
 // 用户直接创建设备（无需验证码）

@@ -180,3 +180,15 @@ func (c *ChatManager) GetClientState() *ClientState {
 func (c *ChatManager) GetDeviceId() string {
 	return c.clientState.DeviceID
 }
+
+// InjectMessage 注入消息到设备
+func (c *ChatManager) InjectMessage(message string, skipLlm bool) error {
+	if skipLlm {
+		// 直接发送文本消息到设备，跳过LLM处理
+		return c.session.AddTextToTTSQueue(message)
+	} else {
+		// 通过LLM处理消息
+		ctx := context.Background()
+		return c.session.actionDoChat(ctx, message)
+	}
+}

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 	"xiaozhi-esp32-server-golang/internal/app/mqtt_server"
 	"xiaozhi-esp32-server-golang/internal/app/server/chat"
@@ -56,6 +58,8 @@ func (a *App) Run() {
 
 	// 注册聊天相关的本地MCP工具
 	a.registerChatMCPTools()
+
+	a.registerHandler()
 
 	select {} // 阻塞主线程
 }
@@ -209,4 +213,53 @@ func (s *App) DeviceOnline(deviceID string) {
 
 func (s *App) DeviceOffline(deviceID string) {
 	manager_client.SendDeviceInactiveRequest(context.Background(), deviceID)
+}
+
+func (a *App) registerHandler() {
+	manager_client.GetDefaultClient().RegisterMessageHandler("/api/device/inject_msg", a.HandleInjectMsg)
+}
+
+// 向客户端注入消息
+func (a *App) HandleInjectMsg(request *manager_client.WebSocketRequest) (string, error) {
+	type InjectMsg struct {
+		SkipLlm  bool   `json:"skip_llm"`
+		DeviceId string `json:"device_id"`
+		Message  string `json:"message"`
+	}
+	body, _ := json.Marshal(request.Body)
+	var msg InjectMsg
+	err := json.Unmarshal(body, &msg)
+	if err != nil {
+		log.Errorf("HandleInjectMsg error: %+v", err)
+		return "", fmt.Errorf("HandleInjectMsg error")
+	}
+
+	// 验证必要参数
+	if msg.DeviceId == "" {
+		log.Errorf("HandleInjectMsg: device_id is required")
+		return "", fmt.Errorf("device_id is required")
+	}
+	if msg.Message == "" {
+		log.Errorf("HandleInjectMsg: message is required")
+		return "", fmt.Errorf("message is required")
+	}
+
+	// 获取指定设备的ChatManager
+	chatManager, exists := a.GetChatManager(msg.DeviceId)
+	if !exists {
+		log.Errorf("HandleInjectMsg: device %s not found or offline", msg.DeviceId)
+		return "", fmt.Errorf("device %s not found or offline", msg.DeviceId)
+	}
+
+	log.Debugf("HandleInjectMsg: injecting message to device %s, skip_llm: %v, message: %s",
+		msg.DeviceId, msg.SkipLlm, msg.Message)
+
+	// 使用ChatManager的公开方法注入消息
+	err = chatManager.InjectMessage(msg.Message, msg.SkipLlm)
+	if err != nil {
+		log.Errorf("HandleInjectMsg: failed to inject message to device %s: %v", msg.DeviceId, err)
+		return "", fmt.Errorf("failed to inject message: %v", err)
+	}
+
+	return "message injected successfully", nil
 }

@@ -653,6 +653,16 @@ func (ctrl *WebSocketController) RequestPingFromClient(ctx context.Context) (*We
 	return ctrl.SendRequestToClient(ctx, "GET", "/api/server/ping", nil)
 }
 
+// InjectMessageToDevice 向设备注入消息
+func (ctrl *WebSocketController) InjectMessageToDevice(ctx context.Context, deviceID, message string, skipLlm bool) error {
+	body := map[string]interface{}{
+		"device_id": deviceID,
+		"message":   message,
+		"skip_llm":  skipLlm,
+	}
+	return ctrl.SendRequestToClientAsync("POST", "/api/device/inject_msg", body)
+}
+
 // 异步发送请求到客户端（不等待响应）
 func (ctrl *WebSocketController) SendRequestToClientAsync(method, path string, body map[string]interface{}) error {
 	ctrl.clientMutex.RLock()

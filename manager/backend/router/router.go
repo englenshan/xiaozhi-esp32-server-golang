@@ -83,6 +83,9 @@ func Setup(db *gorm.DB) *gin.Engine {
 				// MCP接入点
 				user.GET("/agents/:id/mcp-endpoint", userController.GetAgentMCPEndpoint)
 				user.GET("/agents/:id/mcp-tools", userController.GetAgentMcpTools)
+
+				// 消息注入
+				user.POST("/devices/inject-message", userController.InjectMessage)
 			}
 
 			// 管理员路由

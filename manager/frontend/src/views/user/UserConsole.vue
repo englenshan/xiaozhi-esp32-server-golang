@@ -57,10 +57,16 @@
             <span>智能设备</span>
             <span class="device-count">{{ allDevicesData.length }}</span>
           </div>
-          <el-button type="primary" @click="addDevice" class="add-btn">
-            <el-icon><Plus /></el-icon>
-            添加设备
-          </el-button>
+          <div class="action-buttons">
+            <el-button type="success" @click="openInjectMessageDialog" class="add-btn">
+              <el-icon><ChatDotRound /></el-icon>
+              消息注入
+            </el-button>
+            <el-button type="primary" @click="addDevice" class="add-btn">
+              <el-icon><Plus /></el-icon>
+              添加设备
+            </el-button>
+          </div>
         </div>
         
         <div v-if="devices.length === 0" class="empty-container">
@@ -275,6 +281,92 @@
       </div>
     </el-dialog>
 
+    <!-- 消息注入弹窗 -->
+    <el-dialog
+      v-model="showInjectMessageDialog"
+      title="消息注入"
+      width="600px"
+      :close-on-click-modal="false"
+    >
+      <el-form
+        ref="injectFormRef"
+        :model="injectForm"
+        :rules="injectRules"
+        label-width="100px"
+      >
+        <el-form-item label="选择设备" prop="device_id">
+          <el-select
+            v-model="injectForm.device_id"
+            placeholder="请选择要注入消息的设备"
+            style="width: 100%"
+            filterable
+          >
+            <el-option
+              v-for="device in allDevicesData"
+              :key="device.device_code"
+              :label="`${device.device_name || '未命名设备'} (${device.device_code})`"
+              :value="device.device_name || '未命名设备'"
+            >
+              <div class="device-option">
+                <div class="device-option-header">
+                  <span class="device-name">{{ device.device_name || '未命名设备' }}</span>
+                  <el-tag 
+                    :type="isDeviceOnline(device.last_active_at) ? 'success' : 'danger'" 
+                    size="small"
+                  >
+                    {{ isDeviceOnline(device.last_active_at) ? '在线' : '离线' }}
+                  </el-tag>
+                </div>
+                <div class="device-code">{{ device.device_code }}</div>
+                <div class="device-agent">智能体: {{ device.agent_name || '未绑定' }}</div>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        
+        <el-form-item label="消息内容" prop="message">
+          <el-input
+            v-model="injectForm.message"
+            type="textarea"
+            :rows="4"
+            placeholder="请输入要注入的消息内容"
+            maxlength="500"
+            show-word-limit
+          />
+        </el-form-item>
+        
+        <el-form-item label="处理方式" prop="skip_llm">
+          <el-radio-group v-model="injectForm.skip_llm">
+            <el-radio :label="false">
+              <div class="radio-option">
+                <div class="radio-title">通过LLM处理</div>
+                <div class="radio-desc">消息会经过AI智能体处理，生成智能回复</div>
+              </div>
+            </el-radio>
+            <el-radio :label="true">
+              <div class="radio-option">
+                <div class="radio-title">直接播放</div>
+                <div class="radio-desc">消息直接转换为语音播放，不经过AI处理</div>
+              </div>
+            </el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+      
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button @click="handleCloseInjectMessage">取消</el-button>
+          <el-button
+            type="primary"
+            :loading="injectingMessage"
+            @click="handleInjectMessage"
+          >
+            {{ injectingMessage ? '注入中...' : '注入消息' }}
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
     <!-- 添加设备弹窗 -->
     <el-dialog
       v-model="showAddDeviceDialog"
@@ -353,7 +445,8 @@ import {
   CircleCheck,
   Cpu,
   User,
-  Clock
+  Clock,
+  ChatDotRound
 } from '@element-plus/icons-vue'
 import api from '../../utils/api'
 
@@ -446,6 +539,11 @@ const showAddDeviceDialog = ref(false)
 const addingDevice = ref(false)
 const deviceFormRef = ref()
 
+// 消息注入相关状态
+const showInjectMessageDialog = ref(false)
+const injectingMessage = ref(false)
+const injectFormRef = ref()
+
 const deviceForm = reactive({
   device_name: '',
   agent_id: ''
@@ -458,6 +556,22 @@ const deviceRules = {
   ],
   agent_id: [
     { required: true, message: '请选择关联智能体', trigger: 'change' }
+  ]
+}
+
+const injectForm = reactive({
+  device_id: '',
+  message: '',
+  skip_llm: false
+})
+
+const injectRules = {
+  device_id: [
+    { required: true, message: '请选择设备', trigger: 'change' }
+  ],
+  message: [
+    { required: true, message: '请输入消息内容', trigger: 'blur' },
+    { min: 1, max: 500, message: '消息长度在1-500个字符之间', trigger: 'blur' }
   ]
 }
 
@@ -503,6 +617,51 @@ const handleCloseAddDevice = () => {
     deviceFormRef.value.resetFields()
   }
   Object.assign(deviceForm, { device_name: '', agent_id: '' })
+}
+
+// 打开消息注入弹窗
+const openInjectMessageDialog = () => {
+  if (allDevicesData.value.length === 0) {
+    ElMessage.warning('请先添加设备，然后再进行消息注入')
+    return
+  }
+  
+  showInjectMessageDialog.value = true
+}
+
+// 处理消息注入
+const handleInjectMessage = async () => {
+  if (!injectFormRef.value) return
+  
+  try {
+    await injectFormRef.value.validate()
+    injectingMessage.value = true
+    
+    const response = await api.post('/user/devices/inject-message', {
+      device_id: injectForm.device_id,
+      message: injectForm.message,
+      skip_llm: injectForm.skip_llm
+    })
+    
+    if (response.data.success) {
+      ElMessage.success('消息注入成功')
+      handleCloseInjectMessage()
+    }
+  } catch (error) {
+    console.error('消息注入失败:', error)
+    ElMessage.error(error.response?.data?.error || '消息注入失败')
+  } finally {
+    injectingMessage.value = false
+  }
+}
+
+// 关闭消息注入弹窗
+const handleCloseInjectMessage = () => {
+  showInjectMessageDialog.value = false
+  if (injectFormRef.value) {
+    injectFormRef.value.resetFields()
+  }
+  Object.assign(injectForm, { device_id: '', message: '', skip_llm: false })
 }
 
 // 切换显示所有设备
@@ -703,6 +862,11 @@ onMounted(() => {
   margin-bottom: 24px;
   padding-bottom: 16px;
   border-bottom: 1px solid #e9ecef;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 12px;
 }
 
 .section-title {
@@ -1119,6 +1283,50 @@ onMounted(() => {
 /* 弹窗样式 */
 .dialog-footer {
   text-align: right;
+}
+
+/* 消息注入弹窗样式 */
+.device-option {
+  padding: 8px 0;
+}
+
+.device-option-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.device-option .device-name {
+  font-weight: 500;
+  color: #212529;
+}
+
+.device-code {
+  font-size: 12px;
+  color: #6c757d;
+  margin-bottom: 2px;
+}
+
+.device-agent {
+  font-size: 12px;
+  color: #6c757d;
+}
+
+.radio-option {
+  margin-left: 8px;
+}
+
+.radio-title {
+  font-weight: 500;
+  color: #212529;
+  margin-bottom: 2px;
+}
+
+.radio-desc {
+  font-size: 12px;
+  color: #6c757d;
+  line-height: 1.4;
 }
 
 @media (max-width: 480px) {
