@@ -589,7 +589,7 @@ func sendTextToSpeech(conn *websocket.Conn, deviceID string) error {
 
 			go func() {
 				sendListenStart(conn, deviceID, mode)
-				genAndSendAudio(input, 50)
+				genAndSendAudio(input, 100)
 				if mode != "auto" {
 					sendListenStop(conn, deviceID)
 				}
