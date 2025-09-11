@@ -1,4 +1,4 @@
-package manager_client
+package manager
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/spf13/viper"
 
+	"xiaozhi-esp32-server-golang/internal/domain/config/types"
 	"xiaozhi-esp32-server-golang/internal/domain/mcp"
 	log "xiaozhi-esp32-server-golang/logger"
 )
@@ -33,6 +34,7 @@ type WebSocketClient struct {
 	workers        sync.WaitGroup
 
 	messageHandle cmap.ConcurrentMap[string, MessageHandleFunc]
+	uuid          string
 }
 
 type WebSocketRequest struct {
@@ -76,6 +78,7 @@ func NewWebSocketClient() *WebSocketClient {
 		callbacks:      make(map[string]func(*WebSocketResponse)),
 		messageQueue:   make(chan *WebSocketRequest, 100),
 		messageHandle:  cmap.New[MessageHandleFunc](),
+		uuid:           uuid.New().String(),
 	}
 }
 
@@ -99,6 +102,7 @@ func (c *WebSocketClient) Connect(ctx context.Context) error {
 	// 建立WebSocket连接
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
 		"Origin": []string{c.baseURL},
+		"UUID":   []string{c.uuid},
 	})
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %v", err)
@@ -249,16 +253,8 @@ func IsManagerWebSocketConnected() bool {
 	return GetDefaultClient().IsConnected()
 }
 
-func SendDeviceActiveRequest(ctx context.Context, deviceID string) (*WebSocketResponse, error) {
-	return GetDefaultClient().SendRequest(ctx, "POST", "/api/device/active", map[string]interface{}{
-		"device_id": deviceID,
-	})
-}
-
-func SendDeviceInactiveRequest(ctx context.Context, deviceID string) (*WebSocketResponse, error) {
-	return GetDefaultClient().SendRequest(ctx, "POST", "/api/device/inactive", map[string]interface{}{
-		"device_id": deviceID,
-	})
+func SendDeviceRequest(ctx context.Context, path string, body map[string]interface{}) (*WebSocketResponse, error) {
+	return GetDefaultClient().SendRequest(ctx, "POST", path, body)
 }
 
 // startWorkers 启动消息发送工作线程
@@ -481,8 +477,11 @@ func (c *WebSocketClient) handleIncomingRequest(rawMessage map[string]interface{
 	}
 }
 
-func (c *WebSocketClient) RegisterMessageHandler(path string, handler MessageHandleFunc) {
-	c.messageHandle.Set(path, handler)
+func (c *WebSocketClient) RegisterMessageHandler(ctx context.Context, path string, handler types.EventHandler) {
+	f := func(request *WebSocketRequest) (string, error) {
+		return handler(ctx, request.Path, request.Body)
+	}
+	c.messageHandle.Set(path, f)
 }
 
 // handleDefaultRequest 默认请求处理器
@@ -727,4 +726,32 @@ func SendMcpToolListRequestWithCallback(ctx context.Context, agentID string, cal
 		"agent_id": agentID,
 	}
 	return SendManagerRequestWithCallback(ctx, "GET", "/api/mcp/tools", body, callback)
+}
+
+// Init 初始化Manager配置提供者
+// 包括WebSocket连接的初始化
+func Init(ctx context.Context) error {
+	log.Infof("Initializing Manager config provider with WebSocket client")
+
+	// 创建WebSocket客户端
+	client := GetDefaultClient()
+
+	// 连接到WebSocket服务器
+	if err := client.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect WebSocket: %v", err)
+	}
+
+	log.Infof("Manager config provider initialized successfully")
+	return nil
+}
+
+// Close 关闭Manager配置提供者，清理资源
+func Close() error {
+	log.Infof("Closing Manager config provider")
+	return DisconnectManagerWebSocket()
+}
+
+// IsConnected 检查Manager配置提供者是否已连接
+func IsConnected() bool {
+	return IsManagerWebSocketConnected()
 }

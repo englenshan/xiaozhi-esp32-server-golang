@@ -7,10 +7,11 @@ import (
 	"time"
 	"xiaozhi-esp32-server-golang/internal/app/mqtt_server"
 	"xiaozhi-esp32-server-golang/internal/app/server/chat"
-	"xiaozhi-esp32-server-golang/internal/app/server/manager_client"
 	"xiaozhi-esp32-server-golang/internal/app/server/mqtt_udp"
 	"xiaozhi-esp32-server-golang/internal/app/server/types"
 	"xiaozhi-esp32-server-golang/internal/app/server/websocket"
+	user_config "xiaozhi-esp32-server-golang/internal/domain/config"
+	config_types "xiaozhi-esp32-server-golang/internal/domain/config/types"
 	log "xiaozhi-esp32-server-golang/logger"
 
 	cmap "github.com/orcaman/concurrent-map/v2"
@@ -208,27 +209,51 @@ func (s *App) registerChatMCPTools() {
 }
 
 func (s *App) DeviceOnline(deviceID string) {
-	manager_client.SendDeviceActiveRequest(context.Background(), deviceID)
+	eventData := map[string]interface{}{
+		"device_id": deviceID,
+	}
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.NotifyDeviceEvent(context.Background(), config_types.EventDeviceOnline, eventData)
 }
 
 func (s *App) DeviceOffline(deviceID string) {
-	manager_client.SendDeviceInactiveRequest(context.Background(), deviceID)
+	eventData := map[string]interface{}{
+		"device_id": deviceID,
+	}
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.NotifyDeviceEvent(context.Background(), config_types.EventDeviceOffline, eventData)
 }
 
 func (a *App) registerHandler() {
-	manager_client.GetDefaultClient().RegisterMessageHandler("/api/device/inject_msg", a.HandleInjectMsg)
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.RegisterMessageEventHandler(context.Background(), config_types.EventHandleMessageInject, a.HandleInjectMsg)
 }
 
 // 向客户端注入消息
-func (a *App) HandleInjectMsg(request *manager_client.WebSocketRequest) (string, error) {
+func (a *App) HandleInjectMsg(ctx context.Context, eventType string, eventData map[string]interface{}) (string, error) {
 	type InjectMsg struct {
 		SkipLlm  bool   `json:"skip_llm"`
 		DeviceId string `json:"device_id"`
 		Message  string `json:"message"`
 	}
-	body, _ := json.Marshal(request.Body)
+	bodyBytes, _ := json.Marshal(eventData)
 	var msg InjectMsg
-	err := json.Unmarshal(body, &msg)
+	err := json.Unmarshal(bodyBytes, &msg)
 	if err != nil {
 		log.Errorf("HandleInjectMsg error: %+v", err)
 		return "", fmt.Errorf("HandleInjectMsg error")

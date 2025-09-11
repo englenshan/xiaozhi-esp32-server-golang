@@ -21,4 +21,9 @@ type UserConfigProvider interface {
 
 	// 获取 mqtt, mqtt_server, udp, ota, vision配置
 	GetSystemConfig(ctx context.Context) (string, error)
+
+	//注册上行事件处理函数(比如设备上下线等)
+	NotifyDeviceEvent(ctx context.Context, eventType string, eventData map[string]interface{})
+	//注册下行事件处理函数(比如消息注入等)
+	RegisterMessageEventHandler(ctx context.Context, eventType string, eventHandler types.EventHandler)
 }

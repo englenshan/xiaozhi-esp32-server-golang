@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 	"xiaozhi-esp32-server-golang/internal/app/server/auth"
-	manager_client "xiaozhi-esp32-server-golang/internal/app/server/manager_client"
 	redisdb "xiaozhi-esp32-server-golang/internal/db/redis"
 	user_config "xiaozhi-esp32-server-golang/internal/domain/config"
 
@@ -27,10 +26,6 @@ var (
 	configUpdateTicker *time.Ticker
 	configUpdateStop   chan struct{}
 	configUpdateWg     sync.WaitGroup
-
-	// WebSocket重试控制
-	websocketRetryStop chan struct{}
-	websocketRetryWg   sync.WaitGroup
 )
 
 func Init(configFile string) error {
@@ -45,14 +40,15 @@ func Init(configFile string) error {
 	//init log
 	initLog()
 
+	// 初始化配置系统（包括WebSocket连接）
+	ctx := context.Background()
+	if err := user_config.InitConfigSystem(ctx); err != nil {
+		fmt.Printf("初始化配置系统失败: %v\n", err)
+	}
+
 	// 从接口获取配置并更新
 	if err := updateConfigFromAPI(); err != nil {
 		fmt.Printf("从接口获取配置失败，使用本地配置: %v\n", err)
-	}
-
-	// 如果配置类型为manager，连接WebSocket
-	if err := initManagerWebSocket(); err != nil {
-		fmt.Printf("初始化Manager WebSocket连接失败: %v\n", err)
 	}
 
 	// 启动周期性配置更新
@@ -255,164 +251,6 @@ func initRedis() error {
 	return nil
 }
 
-// initManagerWebSocket 初始化Manager WebSocket连接
-func initManagerWebSocket() error {
-	configProviderType := viper.GetString("config_provider.type")
-
-	// 只有当配置类型为manager时才连接WebSocket
-	if configProviderType != "manager" {
-		log.Infof("配置类型为 %s，跳过WebSocket连接", configProviderType)
-		return nil
-	}
-
-	// 初始化WebSocket重试控制通道
-	websocketRetryStop = make(chan struct{})
-
-	// 启动WebSocket连接重试协程
-	websocketRetryWg.Add(1)
-	go retryManagerWebSocketConnection()
-
-	log.Info("Manager WebSocket连接重试协程已启动")
-	return nil
-}
-
-// retryManagerWebSocketConnection 使用退避算法重试WebSocket连接
-func retryManagerWebSocketConnection() {
-	defer websocketRetryWg.Done()
-
-	// 硬编码的退避算法参数
-	initialDelay := 3 * time.Second // 初始延迟3秒
-	maxDelay := 1 * time.Minute     // 最大延迟1分钟
-	backoffMultiplier := 2.0        // 退避倍数
-
-	// 指数退避算法
-	delay := initialDelay
-	retryCount := 0
-
-	for {
-		select {
-		case <-websocketRetryStop:
-			log.Info("收到关闭信号，停止WebSocket重试")
-			return
-		default:
-			// 尝试连接
-			if err := tryConnectManagerWebSocket(); err != nil {
-				retryCount++
-				log.Warnf("Manager WebSocket连接失败 (第%d次): %v", retryCount, err)
-
-				// 计算下一次延迟时间
-				delay = time.Duration(float64(delay) * backoffMultiplier)
-				if delay > maxDelay {
-					delay = maxDelay
-				}
-
-				log.Infof("等待 %v 后重试连接...", delay)
-
-				// 使用select实现可中断的延迟
-				select {
-				case <-websocketRetryStop:
-					log.Info("收到关闭信号，停止WebSocket重试")
-					return
-				case <-time.After(delay):
-					continue
-				}
-			}
-
-			// 连接成功，重置重试计数和延迟
-			log.Info("Manager WebSocket连接成功")
-			retryCount = 0
-			delay = initialDelay
-
-			// 监控连接状态，如果连接断开则重新开始重试
-			if err := monitorWebSocketConnection(); err != nil {
-				log.Warnf("WebSocket连接监控检测到断开: %v", err)
-				continue
-			}
-		}
-	}
-}
-
-// monitorWebSocketConnection 监控WebSocket连接状态
-func monitorWebSocketConnection() error {
-	// 定期发送ping来检测连接状态
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	// 连续ping失败计数
-	pingFailCount := 0
-	maxPingFailCount := 3 // 允许连续失败3次
-
-	for {
-		select {
-		case <-websocketRetryStop:
-			return fmt.Errorf("收到关闭信号")
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := testManagerWebSocketConnection(ctx); err != nil {
-				pingFailCount++
-				log.Warnf("WebSocket连接状态检测失败 (第%d次): %v", pingFailCount, err)
-
-				// 只有连续失败超过阈值才认为连接断开
-				if pingFailCount >= maxPingFailCount {
-					cancel()
-					log.Warnf("连续ping失败%d次，认为WebSocket连接已断开", maxPingFailCount)
-					return fmt.Errorf("连接状态检测失败: %v", err)
-				}
-
-				// 失败次数未达到阈值，继续监控
-				cancel()
-				continue
-			}
-			cancel()
-
-			// ping成功，重置失败计数
-			if pingFailCount > 0 {
-				log.Infof("WebSocket连接状态检测恢复成功，重置失败计数")
-				pingFailCount = 0
-			}
-		}
-	}
-}
-
-// tryConnectManagerWebSocket 尝试连接Manager WebSocket
-func tryConnectManagerWebSocket() error {
-	// 创建上下文，设置较短的超时时间
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// 连接到Manager WebSocket
-	if err := manager_client.ConnectManagerWebSocket(ctx); err != nil {
-		return fmt.Errorf("连接Manager WebSocket失败: %v", err)
-	}
-
-	// 测试连接
-	if err := testManagerWebSocketConnection(ctx); err != nil {
-		return fmt.Errorf("连接测试失败: %v", err)
-	}
-
-	return nil
-}
-
-// testManagerWebSocketConnection 测试Manager WebSocket连接
-func testManagerWebSocketConnection(ctx context.Context) error {
-	// 发送ping请求
-	if err := manager_client.ManagerWebSocketPing(ctx); err != nil {
-		return fmt.Errorf("ping测试失败: %v", err)
-	}
-
-	log.Infof("Manager WebSocket连接测试成功")
-	return nil
-}
-
 func initAuthManager() error {
 	return auth.Init()
-}
-
-// StopWebSocketRetry 优雅关闭WebSocket重试协程
-func StopWebSocketRetry() {
-	if websocketRetryStop != nil {
-		close(websocketRetryStop)
-		websocketRetryWg.Wait()
-		log.Info("WebSocket重试协程已优雅关闭")
-	}
 }

@@ -12,16 +12,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"gorm.io/gorm"
 
 	"xiaozhi/manager/backend/models"
 )
 
 type WebSocketController struct {
-	DB            *gorm.DB
-	upgrader      websocket.Upgrader
-	currentClient *WebSocketClient
-	clientMutex   sync.RWMutex
+	DB         *gorm.DB
+	upgrader   websocket.Upgrader
+	clientsMap cmap.ConcurrentMap[string, *WebSocketClient]
 }
 
 // WebSocketClient 连接到Manager Backend的客户端
@@ -61,12 +61,20 @@ func NewWebSocketController(db *gorm.DB) *WebSocketController {
 				return true // 允许所有来源，生产环境应该限制
 			},
 		},
-		currentClient: nil,
+		clientsMap: cmap.New[*WebSocketClient](),
 	}
 }
 
 // HandleWebSocket 处理WebSocket连接升级
 func (ctrl *WebSocketController) HandleWebSocket(c *gin.Context) {
+	// 获取UUID header
+	clientUUID := c.GetHeader("UUID")
+	if clientUUID == "" {
+		log.Printf("WebSocket连接缺少UUID header")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少UUID header"})
+		return
+	}
+
 	// 升级HTTP连接为WebSocket连接
 	conn, err := ctrl.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -74,19 +82,16 @@ func (ctrl *WebSocketController) HandleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// 如果有现有连接，先断开
-	ctrl.clientMutex.Lock()
-	if ctrl.currentClient != nil && ctrl.currentClient.isConnected {
-		log.Printf("断开现有连接: %s", ctrl.currentClient.ID)
-		ctrl.currentClient.conn.Close()
-		ctrl.currentClient.isConnected = false
+	// 检查是否已存在相同UUID的连接
+	if existingClient, exists := ctrl.clientsMap.Get(clientUUID); exists {
+		log.Printf("断开现有连接: %s", clientUUID)
+		existingClient.conn.Close()
+		existingClient.isConnected = false
 	}
-	ctrl.clientMutex.Unlock()
 
 	// 创建新的客户端
-	clientID := uuid.New().String()
 	client := &WebSocketClient{
-		ID:           clientID,
+		ID:           clientUUID,
 		conn:         conn,
 		controller:   ctrl,
 		requestChans: make(map[string]chan *WebSocketResponse),
@@ -95,12 +100,10 @@ func (ctrl *WebSocketController) HandleWebSocket(c *gin.Context) {
 		stopChan:     make(chan struct{}),
 	}
 
-	// 设置为当前客户端
-	ctrl.clientMutex.Lock()
-	ctrl.currentClient = client
-	ctrl.clientMutex.Unlock()
+	// 存储到clientsMap中
+	ctrl.clientsMap.Set(clientUUID, client)
 
-	log.Printf("新的WebSocket客户端已连接: %s", clientID)
+	log.Printf("新的WebSocket客户端已连接: %s", clientUUID)
 
 	// 启动客户端消息处理
 	go client.handleMessages()
@@ -111,56 +114,55 @@ func (ctrl *WebSocketController) HandleWebSocket(c *gin.Context) {
 
 // 移除客户端
 func (ctrl *WebSocketController) removeClient(clientID string) {
-	ctrl.clientMutex.Lock()
-	defer ctrl.clientMutex.Unlock()
-
-	if ctrl.currentClient != nil && ctrl.currentClient.ID == clientID {
+	if client, exists := ctrl.clientsMap.Get(clientID); exists {
 		// 发送停止信号给心跳检测
 		select {
-		case ctrl.currentClient.stopChan <- struct{}{}:
+		case client.stopChan <- struct{}{}:
 			log.Printf("已发送停止信号给客户端: %s", clientID)
 		default:
 			// 通道可能已满或已关闭，忽略
 		}
 
 		// 确保客户端状态正确设置
-		ctrl.currentClient.isConnected = false
-		ctrl.currentClient = nil
+		client.isConnected = false
+		// 从映射中移除
+		ctrl.clientsMap.Remove(clientID)
 		log.Printf("WebSocket客户端已断开: %s", clientID)
 	}
 }
 
-// 获取当前连接的客户端
-func (ctrl *WebSocketController) GetCurrentClient() *WebSocketClient {
-	ctrl.clientMutex.RLock()
-	defer ctrl.clientMutex.RUnlock()
-	return ctrl.currentClient
-}
-
-// 检查是否有连接的客户端
-func (ctrl *WebSocketController) HasConnectedClient() bool {
-	ctrl.clientMutex.RLock()
-	defer ctrl.clientMutex.RUnlock()
-	return ctrl.currentClient != nil && ctrl.currentClient.isConnected
-}
-
-// 向当前客户端发送消息
-func (ctrl *WebSocketController) SendToCurrentClient(message interface{}) error {
-	ctrl.clientMutex.RLock()
-	client := ctrl.currentClient
-	ctrl.clientMutex.RUnlock()
-
-	if client == nil || !client.isConnected {
-		return fmt.Errorf("没有连接的客户端")
+// 获取客户端通过UUID
+func (ctrl *WebSocketController) GetClient(uuid string) *WebSocketClient {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists {
+		return client
 	}
-
-	return client.conn.WriteJSON(message)
+	return nil
 }
 
-// 广播消息给当前客户端（保持接口一致性）
+// 检查指定UUID的客户端是否连接
+func (ctrl *WebSocketController) IsClientConnected(uuid string) bool {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists {
+		return client.isConnected
+	}
+	return false
+}
+
+// 向指定UUID的客户端发送消息
+func (ctrl *WebSocketController) SendToClient(uuid string, message interface{}) error {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists && client.isConnected {
+		return client.conn.WriteJSON(message)
+	}
+	return fmt.Errorf("客户端 %s 未连接", uuid)
+}
+
+// 广播消息给所有连接的客户端
 func (ctrl *WebSocketController) Broadcast(message interface{}) {
-	if err := ctrl.SendToCurrentClient(message); err != nil {
-		log.Printf("广播消息失败: %v", err)
+	for item := range ctrl.clientsMap.IterBuffered() {
+		if client := item.Val; client.isConnected {
+			if err := client.conn.WriteJSON(message); err != nil {
+				log.Printf("向客户端 %s 广播消息失败: %v", client.ID, err)
+			}
+		}
 	}
 }
 
@@ -547,151 +549,253 @@ func mapToStruct(data map[string]interface{}, target interface{}) error {
 	return json.Unmarshal(jsonData, target)
 }
 
-// 向当前客户端发送请求并等待响应
-func (ctrl *WebSocketController) SendRequestToClient(ctx context.Context, method, path string, body map[string]interface{}) (*WebSocketResponse, error) {
-	ctrl.clientMutex.RLock()
-	client := ctrl.currentClient
-	ctrl.clientMutex.RUnlock()
-
-	if client == nil || !client.isConnected {
-		return nil, fmt.Errorf("没有连接的客户端")
+// 向指定UUID的客户端发送请求并等待响应
+func (ctrl *WebSocketController) SendRequestToClient(ctx context.Context, uuid string, method, path string, body map[string]interface{}) (*WebSocketResponse, error) {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists && client.isConnected {
+		return client.SendRequestWithResponse(ctx, method, path, body)
 	}
-
-	return client.SendRequestWithResponse(ctx, method, path, body)
+	return nil, fmt.Errorf("客户端 %s 未连接", uuid)
 }
 
-// 请求客户端MCP工具列表
+// 请求客户端MCP工具列表（广播方式，等待第一个非空列表响应）
 func (ctrl *WebSocketController) RequestMcpToolsFromClient(ctx context.Context, agentID string) ([]string, error) {
 	log.Printf("开始请求客户端MCP工具列表，agentID: %s", agentID)
-
-	// 检查客户端连接状态
-	ctrl.clientMutex.RLock()
-	client := ctrl.currentClient
-	isConnected := client != nil && client.isConnected
-	ctrl.clientMutex.RUnlock()
-
-	log.Printf("客户端连接状态: connected=%v, client=%v", isConnected, client != nil)
-
-	if !isConnected {
-		return nil, fmt.Errorf("没有连接的客户端")
-	}
 
 	body := map[string]interface{}{
 		"agent_id": agentID,
 	}
 
-	log.Printf("向客户端发送MCP工具列表请求: %s /api/mcp/tools", "GET")
-
-	// 发送请求到客户端
-	response, err := ctrl.SendRequestToClient(ctx, "GET", "/api/mcp/tools", body)
-	if err != nil {
-		log.Printf("请求客户端MCP工具列表失败: %v", err)
-		return nil, fmt.Errorf("请求客户端MCP工具列表失败: %v", err)
+	// 创建响应通道用于接收响应
+	responseChan := make(chan *WebSocketResponse, 10)
+	
+	// 创建唯一的请求ID
+	requestID := uuid.New().String()
+	
+	// 响应处理器
+	responseHandler := func(response *WebSocketResponse) {
+		select {
+		case responseChan <- response:
+		default:
+			log.Printf("响应通道已满，丢弃响应: %s", response.ID)
+		}
 	}
 
-	log.Printf("收到客户端响应: status=%d, body=%+v", response.Status, response.Body)
-
-	// 检查响应状态
-	if response.Status != http.StatusOK {
-		log.Printf("客户端返回错误状态: %d", response.Status)
-		return nil, fmt.Errorf("客户端返回错误状态: %d", response.Status)
-	}
-
-	// 解析响应体中的工具列表
-	if response.Body == nil {
-		log.Printf("客户端响应体为空")
-		return []string{}, nil
-	}
-
-	// 尝试从响应体中提取工具列表
-	toolsData, ok := response.Body["tools"]
-	if !ok {
-		log.Printf("客户端响应体中未找到tools字段")
-		return []string{}, nil
-	}
-
-	log.Printf("找到tools数据: %+v (类型: %T)", toolsData, toolsData)
-
-	// 将工具数据转换为字符串切片
-	var tools []string
-	switch v := toolsData.(type) {
-	case []interface{}:
-		for _, tool := range v {
-			if toolStr, ok := tool.(string); ok {
-				tools = append(tools, toolStr)
-			} else if toolMap, ok := tool.(map[string]interface{}); ok {
-				// 如果工具是对象格式，提取name字段
-				if name, ok := toolMap["name"].(string); ok {
-					tools = append(tools, name)
-				}
+	// 为每个客户端注册回调
+	var callbackMutex sync.Mutex
+	callbacksRegistered := 0
+	
+	for item := range ctrl.clientsMap.IterBuffered() {
+		client := item.Val
+		if client.isConnected {
+			callbackMutex.Lock()
+			client.mu.Lock()
+			client.callbacks[requestID] = responseHandler
+			client.mu.Unlock()
+			callbacksRegistered++
+			callbackMutex.Unlock()
+			
+			// 发送请求到客户端
+			request := WebSocketRequest{
+				ID:     requestID,
+				Method: "GET",
+				Path:   "/api/mcp/tools",
+				Body:   body,
+			}
+			
+			if err := client.conn.WriteJSON(request); err != nil {
+				log.Printf("向客户端 %s 发送MCP工具列表请求失败: %v", client.ID, err)
+			} else {
+				log.Printf("向客户端 %s 发送MCP工具列表请求成功", client.ID)
 			}
 		}
-	case []string:
-		tools = v
-	default:
-		log.Printf("无法解析工具列表格式: %T", toolsData)
-		return nil, fmt.Errorf("无法解析工具列表格式: %T", toolsData)
 	}
 
-	log.Printf("成功解析工具列表: %v", tools)
-	return tools, nil
+	if callbacksRegistered == 0 {
+		return nil, fmt.Errorf("没有连接的客户端")
+	}
+
+	// 清理回调
+	defer func() {
+		for item := range ctrl.clientsMap.IterBuffered() {
+			client := item.Val
+			client.mu.Lock()
+			delete(client.callbacks, requestID)
+			client.mu.Unlock()
+		}
+		close(responseChan)
+	}()
+
+	// 等待所有客户端响应或超时，寻找第一个非空工具列表
+	timeout := time.After(30 * time.Second)
+	responsesReceived := 0
+	
+	for {
+		select {
+		case response := <-responseChan:
+			responsesReceived++
+			log.Printf("收到第%d个客户端响应: status=%d", responsesReceived, response.Status)
+
+			// 检查响应状态
+			if response.Status != http.StatusOK {
+				log.Printf("客户端返回错误状态: %d", response.Status)
+				continue // 继续等待其他客户端响应
+			}
+
+			// 解析响应体中的工具列表
+			if response.Body == nil {
+				log.Printf("客户端响应体为空")
+				continue // 继续等待其他客户端响应
+			}
+
+			// 尝试从响应体中提取工具列表
+			toolsData, ok := response.Body["tools"]
+			if !ok {
+				log.Printf("客户端响应体中未找到tools字段")
+				continue // 继续等待其他客户端响应
+			}
+
+			log.Printf("找到tools数据: %+v (类型: %T)", toolsData, toolsData)
+
+			// 将工具数据转换为字符串切片
+			var tools []string
+			switch v := toolsData.(type) {
+			case []interface{}:
+				for _, tool := range v {
+					if toolStr, ok := tool.(string); ok {
+						tools = append(tools, toolStr)
+					} else if toolMap, ok := tool.(map[string]interface{}); ok {
+						// 如果工具是对象格式，提取name字段
+						if name, ok := toolMap["name"].(string); ok {
+							tools = append(tools, name)
+						}
+					}
+				}
+			case []string:
+				tools = v
+			default:
+				log.Printf("无法解析工具列表格式: %T", toolsData)
+				continue // 继续等待其他客户端响应
+			}
+
+			// 检查是否为非空列表
+			if len(tools) > 0 {
+				log.Printf("成功解析非空工具列表: %v", tools)
+				return tools, nil
+			} else {
+				log.Printf("工具列表为空，继续等待其他客户端响应")
+			}
+
+			// 如果已经收到所有客户端的响应且都为空，返回空列表
+			if responsesReceived >= callbacksRegistered {
+				log.Printf("已收到所有客户端响应，工具列表均为空")
+				return []string{}, nil
+			}
+
+		case <-timeout:
+			log.Printf("请求超时，已收到%d个响应", responsesReceived)
+			return nil, fmt.Errorf("请求超时")
+			
+		case <-ctx.Done():
+			log.Printf("上下文取消，已收到%d个响应", responsesReceived)
+			return nil, fmt.Errorf("上下文取消")
+		}
+	}
 }
 
 // 请求客户端服务器信息
-func (ctrl *WebSocketController) RequestServerInfoFromClient(ctx context.Context) (*WebSocketResponse, error) {
-	return ctrl.SendRequestToClient(ctx, "GET", "/api/server/info", nil)
+func (ctrl *WebSocketController) RequestServerInfoFromClient(ctx context.Context, uuid string) (*WebSocketResponse, error) {
+	return ctrl.SendRequestToClient(ctx, uuid, "GET", "/api/server/info", nil)
 }
 
-func (ctrl *WebSocketController) RequestDeviceActivation(ctx context.Context, deviceID string) (*WebSocketResponse, error) {
-	return ctrl.SendRequestToClient(ctx, "GET", "/api/device/activation", map[string]interface{}{
+func (ctrl *WebSocketController) RequestDeviceActivation(ctx context.Context, uuid, deviceID string) (*WebSocketResponse, error) {
+	return ctrl.SendRequestToClient(ctx, uuid, "GET", "/api/device/activation", map[string]interface{}{
 		"device_id": deviceID,
 	})
 }
 
 // 请求客户端ping
-func (ctrl *WebSocketController) RequestPingFromClient(ctx context.Context) (*WebSocketResponse, error) {
-	return ctrl.SendRequestToClient(ctx, "GET", "/api/server/ping", nil)
+func (ctrl *WebSocketController) RequestPingFromClient(ctx context.Context, uuid string) (*WebSocketResponse, error) {
+	return ctrl.SendRequestToClient(ctx, uuid, "GET", "/api/server/ping", nil)
 }
 
-// InjectMessageToDevice 向设备注入消息
+// InjectMessageToDevice 向设备注入消息（广播方式）
 func (ctrl *WebSocketController) InjectMessageToDevice(ctx context.Context, deviceID, message string, skipLlm bool) error {
 	body := map[string]interface{}{
 		"device_id": deviceID,
 		"message":   message,
 		"skip_llm":  skipLlm,
 	}
-	return ctrl.SendRequestToClientAsync("POST", "/api/device/inject_msg", body)
-}
 
-// 异步发送请求到客户端（不等待响应）
-func (ctrl *WebSocketController) SendRequestToClientAsync(method, path string, body map[string]interface{}) error {
-	ctrl.clientMutex.RLock()
-	client := ctrl.currentClient
-	ctrl.clientMutex.RUnlock()
+	// 创建请求
+	request := WebSocketRequest{
+		ID:     uuid.New().String(),
+		Method: "POST",
+		Path:   "/api/device/inject_msg",
+		Body:   body,
+	}
 
-	if client == nil || !client.isConnected {
+	// 广播给所有连接的客户端
+	var lastError error
+	clientCount := 0
+
+	for item := range ctrl.clientsMap.IterBuffered() {
+		client := item.Val
+		if client.isConnected {
+			clientCount++
+			if err := client.conn.WriteJSON(request); err != nil {
+				log.Printf("向客户端 %s 广播注入消息失败: %v", client.ID, err)
+				lastError = err
+			} else {
+				log.Printf("向客户端 %s 广播注入消息成功", client.ID)
+			}
+		}
+	}
+
+	if clientCount == 0 {
 		return fmt.Errorf("没有连接的客户端")
 	}
 
-	return client.SendRequest(method, path, body)
+	return lastError
 }
 
-// 获取客户端连接状态
-func (ctrl *WebSocketController) GetClientConnectionStatus() map[string]interface{} {
-	ctrl.clientMutex.RLock()
-	defer ctrl.clientMutex.RUnlock()
+// 异步发送请求到客户端（不等待响应）
+func (ctrl *WebSocketController) SendRequestToClientAsync(uuid string, method, path string, body map[string]interface{}) error {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists && client.isConnected {
+		return client.SendRequest(method, path, body)
+	}
+	return fmt.Errorf("客户端 %s 未连接", uuid)
+}
 
-	if ctrl.currentClient == nil {
+// 获取所有客户端连接状态
+func (ctrl *WebSocketController) GetClientConnectionStatus() map[string]interface{} {
+	clients := make([]map[string]interface{}, 0)
+	for item := range ctrl.clientsMap.IterBuffered() {
+		client := item.Val
+		clients = append(clients, map[string]interface{}{
+			"uuid":      client.ID,
+			"connected": client.isConnected,
+		})
+	}
+
+	return map[string]interface{}{
+		"clients": clients,
+		"count":   len(clients),
+	}
+}
+
+// 获取指定客户端连接状态
+func (ctrl *WebSocketController) GetClientStatus(uuid string) map[string]interface{} {
+	if client, exists := ctrl.clientsMap.Get(uuid); exists {
 		return map[string]interface{}{
-			"connected": false,
-			"client_id": "",
-			"message":   "没有连接的客户端",
+			"uuid":      client.ID,
+			"connected": client.isConnected,
+			"message":   "客户端已连接",
 		}
 	}
 
 	return map[string]interface{}{
-		"connected": ctrl.currentClient.isConnected,
-		"client_id": ctrl.currentClient.ID,
-		"message":   "客户端已连接",
+		"uuid":      uuid,
+		"connected": false,
+		"message":   "客户端未连接",
 	}
 }
