@@ -95,6 +95,8 @@ func (s *WebSocketServer) Start() error {
 	http.HandleFunc("/xiaozhi/api/mcp/tools/", s.handleMCPAPI)
 	http.HandleFunc("/xiaozhi/api/vision", s.handleVisionAPI) //图片识别API
 
+	http.HandleFunc("/admin/inject_msg", s.handleInjectMsg)
+
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", s.port)
 	log.Infof("WebSocket 服务器启动在 ws://%s/xiaozhi/v1/", listenAddr)
 	log.Infof("MCP WebSocket 端点: ws://%s/mcp?token=xxx", listenAddr)
@@ -169,5 +171,9 @@ func (s *WebSocketServer) internalHandleChat(w http.ResponseWriter, r *http.Requ
 	if s.onNewConnection != nil {
 		s.onNewConnection(wsConn)
 	}
+
+}
+
+func (s *WebSocketServer) handleInjectMsg(w http.ResponseWriter, r *http.Request) {
 
 }

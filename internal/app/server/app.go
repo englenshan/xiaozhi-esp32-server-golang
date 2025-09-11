@@ -2,13 +2,16 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 	"xiaozhi-esp32-server-golang/internal/app/mqtt_server"
 	"xiaozhi-esp32-server-golang/internal/app/server/chat"
-	"xiaozhi-esp32-server-golang/internal/app/server/manager_client"
 	"xiaozhi-esp32-server-golang/internal/app/server/mqtt_udp"
 	"xiaozhi-esp32-server-golang/internal/app/server/types"
 	"xiaozhi-esp32-server-golang/internal/app/server/websocket"
+	user_config "xiaozhi-esp32-server-golang/internal/domain/config"
+	config_types "xiaozhi-esp32-server-golang/internal/domain/config/types"
 	log "xiaozhi-esp32-server-golang/logger"
 
 	cmap "github.com/orcaman/concurrent-map/v2"
@@ -56,6 +59,8 @@ func (a *App) Run() {
 
 	// 注册聊天相关的本地MCP工具
 	a.registerChatMCPTools()
+
+	a.registerHandler()
 
 	select {} // 阻塞主线程
 }
@@ -204,9 +209,82 @@ func (s *App) registerChatMCPTools() {
 }
 
 func (s *App) DeviceOnline(deviceID string) {
-	manager_client.SendDeviceActiveRequest(context.Background(), deviceID)
+	eventData := map[string]interface{}{
+		"device_id": deviceID,
+	}
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.NotifyDeviceEvent(context.Background(), config_types.EventDeviceOnline, eventData)
 }
 
 func (s *App) DeviceOffline(deviceID string) {
-	manager_client.SendDeviceInactiveRequest(context.Background(), deviceID)
+	eventData := map[string]interface{}{
+		"device_id": deviceID,
+	}
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.NotifyDeviceEvent(context.Background(), config_types.EventDeviceOffline, eventData)
+}
+
+func (a *App) registerHandler() {
+	providerType := viper.GetString("config_provider.type")
+	provider, err := user_config.GetProvider(providerType)
+	if err != nil {
+		log.Errorf("GetProvider err: %+v", err)
+		return
+	}
+	provider.RegisterMessageEventHandler(context.Background(), config_types.EventHandleMessageInject, a.HandleInjectMsg)
+}
+
+// 向客户端注入消息
+func (a *App) HandleInjectMsg(ctx context.Context, eventType string, eventData map[string]interface{}) (string, error) {
+	type InjectMsg struct {
+		SkipLlm  bool   `json:"skip_llm"`
+		DeviceId string `json:"device_id"`
+		Message  string `json:"message"`
+	}
+	bodyBytes, _ := json.Marshal(eventData)
+	var msg InjectMsg
+	err := json.Unmarshal(bodyBytes, &msg)
+	if err != nil {
+		log.Errorf("HandleInjectMsg error: %+v", err)
+		return "", fmt.Errorf("HandleInjectMsg error")
+	}
+
+	// 验证必要参数
+	if msg.DeviceId == "" {
+		log.Errorf("HandleInjectMsg: device_id is required")
+		return "", fmt.Errorf("device_id is required")
+	}
+	if msg.Message == "" {
+		log.Errorf("HandleInjectMsg: message is required")
+		return "", fmt.Errorf("message is required")
+	}
+
+	// 获取指定设备的ChatManager
+	chatManager, exists := a.GetChatManager(msg.DeviceId)
+	if !exists {
+		log.Errorf("HandleInjectMsg: device %s not found or offline", msg.DeviceId)
+		return "", fmt.Errorf("device %s not found or offline", msg.DeviceId)
+	}
+
+	log.Debugf("HandleInjectMsg: injecting message to device %s, skip_llm: %v, message: %s",
+		msg.DeviceId, msg.SkipLlm, msg.Message)
+
+	// 使用ChatManager的公开方法注入消息
+	err = chatManager.InjectMessage(msg.Message, msg.SkipLlm)
+	if err != nil {
+		log.Errorf("HandleInjectMsg: failed to inject message to device %s: %v", msg.DeviceId, err)
+		return "", fmt.Errorf("failed to inject message: %v", err)
+	}
+
+	return "message injected successfully", nil
 }

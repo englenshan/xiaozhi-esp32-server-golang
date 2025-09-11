@@ -114,7 +114,6 @@ func (g *GlobalMCPManager) Start() error {
 		if config.Enabled {
 			if err := g.connectToServer(config); err != nil {
 				log.Errorf("连接到MCP服务器 %s 失败: %v", config.Name, err)
-				// 继续尝试连接其他服务器，而不是直接返回错误
 			} else {
 				connectedCount++
 			}
@@ -152,6 +151,23 @@ func (g *GlobalMCPManager) Stop() error {
 	return nil
 }
 
+// createFailedConnection 创建失败的连接对象用于后续重连
+func (g *GlobalMCPManager) createFailedConnection(config MCPServerConfig) {
+	conn := &MCPServerConnection{
+		config:     config,
+		tools:      make(map[string]tool.InvokableTool),
+		connected:  false,
+		lastError:  fmt.Errorf("初始化连接失败"),
+		retryCount: 0,
+	}
+
+	g.mu.Lock()
+	g.servers[config.Name] = conn
+	g.mu.Unlock()
+
+	log.Infof("已为失败的MCP服务器创建连接对象: %s", config.Name)
+}
+
 // connectToServer 连接到MCP服务器
 func (g *GlobalMCPManager) connectToServer(config MCPServerConfig) error {
 	// 验证配置
@@ -171,6 +187,25 @@ func (g *GlobalMCPManager) connectToServer(config MCPServerConfig) error {
 		tools:  make(map[string]tool.InvokableTool),
 	}
 
+	g.mu.Lock()
+	g.servers[config.Name] = conn
+	g.mu.Unlock()
+
+	// 连接到服务器
+	if err := conn.connect(); err != nil {
+		return fmt.Errorf("连接MCP服务器失败: %v", err)
+	}
+
+	log.Infof("已连接到MCP服务器: %s", config.Name)
+	return nil
+}
+
+// connect 连接到MCP服务器
+func (conn *MCPServerConnection) connect() error {
+	// 使用背景上下文，不设置超时，让SSE连接长期保持
+	ctx := context.Background()
+
+	config := conn.config
 	var transportInstance transport.Interface
 	var err error
 
@@ -199,34 +234,7 @@ func (g *GlobalMCPManager) connectToServer(config MCPServerConfig) error {
 
 	conn.client = mcpClient
 
-	// 连接到服务器
-	if err := conn.connect(); err != nil {
-		return fmt.Errorf("连接MCP服务器失败: %v", err)
-	}
-
-	g.mu.Lock()
-	g.servers[config.Name] = conn
-	g.mu.Unlock()
-
-	log.Infof("已连接到MCP服务器: %s", config.Name)
-	return nil
-}
-
-// connect 连接到MCP服务器
-func (conn *MCPServerConnection) connect() error {
-	// 使用背景上下文，不设置超时，让SSE连接长期保持
-	ctx := context.Background()
-
-	// 如果client为空，重新创建client
-	if conn.client == nil {
-		sseTransport, err := transport.NewSSE(conn.config.SSEUrl)
-		if err != nil {
-			return fmt.Errorf("创建SSE传输层失败: %v", err)
-		}
-		conn.client = client.NewClient(sseTransport)
-	}
-
-	log.Infof("开始连接MCP服务器: %s, SSE URL: %s", conn.config.Name, conn.config.SSEUrl)
+	log.Infof("开始连接MCP服务器: %s, %s URL: %s", conn.config.Name, conn.config.Type, conn.config.SSEUrl)
 
 	// 启动客户端
 	if err := conn.client.Start(ctx); err != nil {
@@ -401,38 +409,13 @@ func isSessionClosedError(err error) bool {
 
 // monitorConnections 监控连接状态
 func (g *GlobalMCPManager) monitorConnections() {
-	ticker := time.NewTicker(g.reconnectConf.Interval)
-	pingTicker := time.NewTicker(60 * time.Second) // 每30秒ping一次
-	defer ticker.Stop()
+	pingTicker := time.NewTicker(20 * time.Second) // 每60秒ping一次
 	defer pingTicker.Stop()
 
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
-		case <-ticker.C:
-			g.checkAndReconnect()
-
-			// 定时健康检查
-			g.mu.RLock()
-			for name, conn := range g.servers {
-				go func(name string, conn *MCPServerConnection) {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					if err := conn.refreshTools(ctx); err != nil {
-						if isSessionClosedError(err) {
-							log.Warnf("MCP服务器 %s 健康检查失败(session closed): %v", name, err)
-							conn.mu.Lock()
-							conn.connected = false
-							conn.lastError = err
-							conn.mu.Unlock()
-						} else {
-							log.Debugf("MCP服务器 %s 健康检查失败(非session closed错误): %v", name, err)
-						}
-					}
-				}(name, conn)
-			}
-			g.mu.RUnlock()
 		case <-pingTicker.C:
 			// 执行ping检测
 			g.mu.RLock()
@@ -442,51 +425,21 @@ func (g *GlobalMCPManager) monitorConnections() {
 					defer cancel()
 
 					if err := conn.ping(ctx); err != nil {
-						log.Warnf("MCP服务器 %s ping失败: %v", name, err)
-						if isSessionClosedError(err) {
-							conn.mu.Lock()
-							conn.connected = false
-							conn.lastError = err
-							conn.mu.Unlock()
-						}
+						log.Warnf("MCP服务器 %s ping失败，开始重连: %v", name, err)
+						// ping失败时直接标记为断开并触发重连
+						conn.mu.Lock()
+						conn.connected = false
+						conn.lastError = err
+						conn.mu.Unlock()
+
+						// 直接触发重连
+						go g.reconnectServer(name)
 					} else {
 						//log.Debugf("MCP服务器 %s ping成功", name)
 					}
 				}(name, conn)
 			}
 			g.mu.RUnlock()
-		}
-	}
-}
-
-// checkAndReconnect 检查并重连断开的服务器
-func (g *GlobalMCPManager) checkAndReconnect() {
-	g.mu.RLock()
-	servers := make(map[string]*MCPServerConnection)
-	for name, conn := range g.servers {
-		servers[name] = conn
-	}
-	g.mu.RUnlock()
-
-	for name, conn := range servers {
-		conn.mu.RLock()
-		connected := conn.connected
-		retryCount := conn.retryCount
-		conn.mu.RUnlock()
-
-		if !connected && retryCount < g.reconnectConf.MaxAttempts {
-			log.Infof("尝试重连MCP服务器: %s (第%d次)", name, retryCount+1)
-
-			conn.mu.Lock()
-			conn.retryCount++
-			conn.mu.Unlock()
-
-			if _, err := g.reconnectServer(name); err != nil {
-				log.Errorf("重连MCP服务器 %s 失败: %v", name, err)
-				conn.mu.Lock()
-				conn.lastError = err
-				conn.mu.Unlock()
-			}
 		}
 	}
 }

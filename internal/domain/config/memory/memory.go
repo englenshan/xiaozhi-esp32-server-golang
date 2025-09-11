@@ -130,3 +130,27 @@ func (m *MemoryUserConfigProvider) ListUserIDs() []string {
 	}
 	return userIDs
 }
+
+// GetSystemConfig 获取系统配置
+func (m *MemoryUserConfigProvider) GetSystemConfig(ctx context.Context) (string, error) {
+	// 内存配置提供者不提供系统配置
+	return "", nil
+}
+
+// Init 初始化Memory配置提供者
+func Init(ctx context.Context) error {
+	log.Log().Info("Memory config provider initialized successfully")
+	return nil
+}
+
+// Close 关闭Memory配置提供者，清理资源
+func Close() error {
+	log.Log().Info("Memory config provider closed")
+	return nil
+}
+
+// IsConnected 检查Memory配置提供者是否已连接
+func IsConnected() bool {
+	// 内存配置提供者始终是"连接"状态
+	return true
+}

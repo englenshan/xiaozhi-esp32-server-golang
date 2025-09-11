@@ -214,3 +214,14 @@ func (c *ConfigManager) LoadSystemConfigToViper(ctx context.Context) error {
 	log.Log().Info("系统配置已成功加载到viper", "config_size", len(configJSON))
 	return nil
 }
+
+func (c *ConfigManager) NotifyDeviceEvent(ctx context.Context, eventType string, eventData map[string]interface{}) {
+	_, err := SendDeviceRequest(ctx, eventType, eventData)
+	if err != nil {
+		log.Log().Error("发送设备事件失败", "error", err)
+	}
+}
+
+func (c *ConfigManager) RegisterMessageEventHandler(ctx context.Context, eventType string, handler types.EventHandler) {
+	GetDefaultClient().RegisterMessageHandler(ctx, eventType, handler)
+}

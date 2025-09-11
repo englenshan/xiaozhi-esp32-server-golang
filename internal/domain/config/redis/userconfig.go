@@ -181,3 +181,31 @@ func (u *UserConfig) GetSystemConfig(ctx context.Context) (string, error) {
 	//默认不覆盖
 	return "", nil
 }
+
+func (u *UserConfig) NotifyDeviceEvent(ctx context.Context, eventType string, eventData map[string]interface{}) {
+	// 实现设备事件通知逻辑
+	return
+}
+
+func (u *UserConfig) RegisterMessageEventHandler(ctx context.Context, deviceID string, handler types.EventHandler) {
+	// 实现消息事件处理逻辑
+	return
+}
+
+// Init 初始化Redis配置提供者
+func Init(ctx context.Context) error {
+	log.Log().Info("Redis config provider initialized successfully")
+	return nil
+}
+
+// Close 关闭Redis配置提供者，清理资源
+func Close() error {
+	log.Log().Info("Redis config provider closed")
+	return nil
+}
+
+// IsConnected 检查Redis配置提供者是否已连接
+func IsConnected() bool {
+	// Redis连接状态由全局Redis客户端管理
+	return true
+}
