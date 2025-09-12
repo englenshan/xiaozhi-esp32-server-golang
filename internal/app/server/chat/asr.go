@@ -112,12 +112,7 @@ func (a *ASRManager) ProcessVadAudio(ctx context.Context, onClose func()) {
 					//log.Debugf("isVad, pcmData len: %d, vadPcmData len: %d, haveVoice: %v", len(pcmData), len(vadPcmData), haveVoice)
 				}
 
-				if haveVoice {
-					//log.Infof("检测到语音, len: %d", len(pcmData))
-					state.SetClientHaveVoice(true)
-					state.SetClientHaveVoiceLastTime(time.Now().UnixMilli())
-					state.Vad.ResetIdleDuration()
-				} else {
+				if !haveVoice || state.Asr.AutoEnd {
 					state.Vad.AddIdleDuration(int64(audioFormat.FrameDuration))
 					idleDuration := state.Vad.GetIdleDuration()
 					log.Infof("空闲时间: %dms", idleDuration)
@@ -127,6 +122,16 @@ func (a *ASRManager) ProcessVadAudio(ctx context.Context, onClose func()) {
 						onClose()
 						return
 					}
+				}
+
+				if haveVoice {
+					//log.Infof("检测到语音, len: %d", len(pcmData))
+					state.SetClientHaveVoice(true)
+					state.SetClientHaveVoiceLastTime(time.Now().UnixMilli())
+					if !state.Asr.AutoEnd {
+						state.Vad.ResetIdleDuration()
+					}
+				} else {
 					//如果之前没有语音, 本次也没有语音, 则从缓存中删除
 					if !clientHaveVoice {
 						//保留近10帧
