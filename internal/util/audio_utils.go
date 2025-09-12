@@ -131,6 +131,7 @@ type AudioDecoder struct {
 	perFrameDurationMs int
 	AudioFormat        string
 	targetSampleRate   int
+	TargetAudioFormat  string
 
 	outputOpusChan chan []byte     //opus一帧一帧的输出
 	ctx            context.Context // 新增：上下文控制
@@ -145,6 +146,7 @@ func CreateAudioDecoder(ctx context.Context, pipeReader io.ReadCloser, outputOpu
 		perFrameDurationMs: perFrameDurationMs,
 		AudioFormat:        AudioFormat,
 		ctx:                ctx,
+		TargetAudioFormat:  "opus",
 	}, nil
 }
 
@@ -158,11 +160,17 @@ func CreateAudioDecoderWithSampleRate(ctx context.Context, pipeReader io.ReadClo
 		AudioFormat:        AudioFormat,
 		targetSampleRate:   targetSampleRate,
 		ctx:                ctx,
+		TargetAudioFormat:  "opus",
 	}, nil
 }
 
 func (d *AudioDecoder) WithFormat(format beep.Format) *AudioDecoder {
 	d.format = format
+	return d
+}
+
+func (d *AudioDecoder) WithTargetAudioFormat(targetAudioFormat string) *AudioDecoder {
+	d.TargetAudioFormat = targetAudioFormat
 	return d
 }
 
@@ -212,11 +220,16 @@ func (d *AudioDecoder) RunWavDecoder(startTs int64, isRaw bool) error {
 		log.Debugf("将多声道音频转换为单声道输出")
 	}
 
-	enc, err := opus.NewEncoder(int(sampleRate), outputChannels, opus.AppAudio)
-	if err != nil {
-		return fmt.Errorf("创建Opus编码器失败: %v", err)
+	// 根据目标格式决定是否创建Opus编码器
+	var enc *opus.Encoder
+	var err error
+	if d.TargetAudioFormat == "opus" {
+		enc, err = opus.NewEncoder(int(sampleRate), outputChannels, opus.AppAudio)
+		if err != nil {
+			return fmt.Errorf("创建Opus编码器失败: %v", err)
+		}
+		d.enc = enc
 	}
-	d.enc = enc
 
 	//opus相关配置及缓冲区
 	frameDurationMs := d.perFrameDurationMs              //每帧时长(ms)
@@ -243,11 +256,18 @@ func (d *AudioDecoder) RunWavDecoder(startTs int64, isRaw bool) error {
 					paddedFrame := make([]int16, frameSize)
 					copy(paddedFrame, pcmBuffer[:currentFramePos])
 
-					// 编码最后一帧
-					if n, err := d.enc.Encode(paddedFrame, opusBuffer); err == nil {
-						frameData := make([]byte, n)
-						copy(frameData, opusBuffer[:n])
-						d.outputOpusChan <- frameData
+					// 根据目标格式输出数据
+					if d.TargetAudioFormat == "opus" {
+						// 编码最后一帧
+						if n, err := d.enc.Encode(paddedFrame, opusBuffer); err == nil {
+							frameData := make([]byte, n)
+							copy(frameData, opusBuffer[:n])
+							d.outputOpusChan <- frameData
+						}
+					} else if d.TargetAudioFormat == "pcm" {
+						// 直接输出PCM数据
+						pcmData := Int16SliceToBytes(paddedFrame)
+						d.outputOpusChan <- pcmData
 					}
 				}
 				return nil
@@ -272,18 +292,24 @@ func (d *AudioDecoder) RunWavDecoder(startTs int64, isRaw bool) error {
 				pcmBuffer[currentFramePos] = avgSample
 				currentFramePos++
 
-				// 如果缓冲区已满,进行编码
+				// 如果缓冲区已满,进行编码或输出
 				if currentFramePos == frameSize {
-					if n, err := d.enc.Encode(pcmBuffer, opusBuffer); err == nil {
-						frameData := make([]byte, n)
-						copy(frameData, opusBuffer[:n])
+					if !firstFrame {
+						firstFrame = true
+						log.Infof("tts云端->首帧解码完成耗时: %d ms", time.Now().UnixMilli()-startTs)
+					}
 
-						if !firstFrame {
-							firstFrame = true
-							log.Infof("tts云端->首帧解码完成耗时: %d ms", time.Now().UnixMilli()-startTs)
+					if d.TargetAudioFormat == "opus" {
+						// Opus编码输出
+						if n, err := d.enc.Encode(pcmBuffer, opusBuffer); err == nil {
+							frameData := make([]byte, n)
+							copy(frameData, opusBuffer[:n])
+							d.outputOpusChan <- frameData
 						}
-
-						d.outputOpusChan <- frameData
+					} else if d.TargetAudioFormat == "pcm" {
+						// 直接输出PCM数据
+						pcmData := Int16SliceToBytes(pcmBuffer)
+						d.outputOpusChan <- pcmData
 					}
 					currentFramePos = 0
 				}
@@ -323,11 +349,15 @@ func (d *AudioDecoder) RunMp3Decoder(startTs int64) error {
 		opusSampleRate = d.targetSampleRate
 	}
 
-	enc, err := opus.NewEncoder(opusSampleRate, outputChannels, opus.AppAudio)
-	if err != nil {
-		return fmt.Errorf("创建Opus编码器失败: %v", err)
+	// 根据目标格式决定是否创建Opus编码器
+	var enc *opus.Encoder
+	if d.TargetAudioFormat == "opus" {
+		enc, err = opus.NewEncoder(opusSampleRate, outputChannels, opus.AppAudio)
+		if err != nil {
+			return fmt.Errorf("创建Opus编码器失败: %v", err)
+		}
+		d.enc = enc
 	}
-	d.enc = enc
 
 	//opus相关配置及缓冲区 创建缓冲区用于接收音频采样
 	frameDurationMs := d.perFrameDurationMs               //60ms
@@ -345,7 +375,7 @@ func (d *AudioDecoder) RunMp3Decoder(startTs int64) error {
 	var firstFrame bool
 	frameCount := 0
 
-	log.Debugf("MP3解码器开始，目标采样率: %d, 帧大小: %d", opusSampleRate, frameSize)
+	log.Debugf("MP3解码器开始，目标采样率: %d, 帧大小: %d, 目标格式: %s", opusSampleRate, frameSize, d.TargetAudioFormat)
 
 	for {
 		select {
@@ -375,20 +405,34 @@ func (d *AudioDecoder) RunMp3Decoder(startTs int64) error {
 						opusPcmBuffer = Float32SliceToInt16Slice(pcmFloat32)
 					}
 
-					// 编码补齐后的完整帧
-					n, err := enc.Encode(opusPcmBuffer, opusBuffer)
-					if err != nil {
-						log.Errorf("编码剩余数据失败: %v", err)
-						return fmt.Errorf("编码剩余数据失败: %v", err)
-					} else {
-						frameData := make([]byte, n)
-						copy(frameData, opusBuffer[:n])
+					// 根据目标格式输出数据
+					if d.TargetAudioFormat == "opus" {
+						// 编码补齐后的完整帧
+						n, err := enc.Encode(opusPcmBuffer, opusBuffer)
+						if err != nil {
+							log.Errorf("编码剩余数据失败: %v", err)
+							return fmt.Errorf("编码剩余数据失败: %v", err)
+						} else {
+							frameData := make([]byte, n)
+							copy(frameData, opusBuffer[:n])
 
+							select {
+							case <-d.ctx.Done():
+								log.Debugf("mp3Decoder context done, exit")
+								return nil
+							case d.outputOpusChan <- frameData:
+								frameCount++
+								log.Debugf("MP3解码完成，总共处理 %d 帧", frameCount)
+							}
+						}
+					} else if d.TargetAudioFormat == "pcm" {
+						// 直接输出PCM数据
+						pcmData := Int16SliceToBytes(opusPcmBuffer)
 						select {
 						case <-d.ctx.Done():
 							log.Debugf("mp3Decoder context done, exit")
 							return nil
-						case d.outputOpusChan <- frameData:
+						case d.outputOpusChan <- pcmData:
 							frameCount++
 							log.Debugf("MP3解码完成，总共处理 %d 帧", frameCount)
 						}
@@ -418,8 +462,13 @@ func (d *AudioDecoder) RunMp3Decoder(startTs int64) error {
 				pcmBuffer[currentFramePos] = monoSample
 				currentFramePos++
 
-				// 如果pcmBuffer已满一帧，则进行编码
+				// 如果pcmBuffer已满一帧，则进行编码或输出
 				if currentFramePos == len(pcmBuffer) {
+					if !firstFrame {
+						firstFrame = true
+						log.Infof("tts云端->首帧解码完成耗时: %d ms", time.Now().UnixMilli()-startTs)
+					}
+
 					var opusPcmBuffer []int16 = pcmBuffer
 					if d.targetSampleRate > 0 {
 						pcmBytes := Int16SliceToBytes(opusPcmBuffer)
@@ -427,32 +476,43 @@ func (d *AudioDecoder) RunMp3Decoder(startTs int64) error {
 						pcmFloat32 = ResampleLinearFloat32(pcmFloat32, int(sampleRate), d.targetSampleRate)
 						opusPcmBuffer = Float32SliceToInt16Slice(pcmFloat32)
 					}
-					// 将float32转换为int16
-					opusLen, err := enc.Encode(opusPcmBuffer, opusBuffer)
-					if err != nil {
-						log.Errorf("MP3解码编码失败: %v", err)
-						// 编码失败时，跳过这一帧但继续处理
-						currentFramePos = 0 // 重置帧位置
-						continue
-					}
 
-					// 将当前帧复制到新的切片中并添加到帧数组
-					frameData := make([]byte, opusLen)
-					copy(frameData, opusBuffer[:opusLen])
-
-					select {
-					case <-d.ctx.Done():
-						log.Debugf("mp3Decoder context done, exit")
-						return nil
-					case d.outputOpusChan <- frameData:
-						frameCount++
-						if !firstFrame {
-							firstFrame = true
-							log.Infof("tts云端->首帧解码完成耗时: %d ms", time.Now().UnixMilli()-startTs)
+					if d.TargetAudioFormat == "opus" {
+						// Opus编码输出
+						opusLen, err := enc.Encode(opusPcmBuffer, opusBuffer)
+						if err != nil {
+							log.Errorf("MP3解码编码失败: %v", err)
+							// 编码失败时，跳过这一帧但继续处理
+							currentFramePos = 0 // 重置帧位置
+							continue
 						}
 
-						if frameCount%100 == 0 {
-							log.Debugf("MP3解码已处理 %d 帧", frameCount)
+						// 将当前帧复制到新的切片中并添加到帧数组
+						frameData := make([]byte, opusLen)
+						copy(frameData, opusBuffer[:opusLen])
+
+						select {
+						case <-d.ctx.Done():
+							log.Debugf("mp3Decoder context done, exit")
+							return nil
+						case d.outputOpusChan <- frameData:
+							frameCount++
+							if frameCount%100 == 0 {
+								log.Debugf("MP3解码已处理 %d 帧", frameCount)
+							}
+						}
+					} else if d.TargetAudioFormat == "pcm" {
+						// 直接输出PCM数据
+						pcmData := Int16SliceToBytes(opusPcmBuffer)
+						select {
+						case <-d.ctx.Done():
+							log.Debugf("mp3Decoder context done, exit")
+							return nil
+						case d.outputOpusChan <- pcmData:
+							frameCount++
+							if frameCount%100 == 0 {
+								log.Debugf("MP3解码已处理 %d 帧", frameCount)
+							}
 						}
 					}
 
