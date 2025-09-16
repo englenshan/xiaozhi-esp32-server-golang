@@ -390,8 +390,8 @@ func (g *GlobalMCPManager) GetToolByName(name string) (tool.InvokableTool, bool)
 
 	//所有的server
 	for _, conn := range g.servers {
-		name = fmt.Sprintf("%s_%s", conn.config.Name, name)
-		mcpToolInterface, exists := g.tools[name]
+		sname := fmt.Sprintf("%s_%s", conn.config.Name, name)
+		mcpToolInterface, exists := g.tools[sname]
 		if exists {
 			return mcpToolInterface, true
 		}
