@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # MySQL数据库服务
   mysql:
-    image: docker.jsdelivr.fyi/mysql:8.0
+    image: mysql:8.0
     container_name: xiaozhi-mysql
     environment:
       MYSQL_ROOT_PASSWORD: password
@@ -25,7 +25,7 @@ services:
 
   # 主程序服务
   main-server:
-    image: docker.jsdelivr.fyi/hackers365/xiaozhi_server:0.5
+    image: hackers365/xiaozhi_server:0.5
     container_name: xiaozhi-main-server
     command: ["/workspace/bin/xiaozhi_server", "-c", "/workspace/config/config.yaml"]
     ports:
@@ -53,7 +53,7 @@ services:
 
   # 后端管理服务
   backend:
-    image: docker.jsdelivr.fyi/hackers365/xiaozhi_manager_backend:0.5
+    image: hackers365/xiaozhi_manager_backend:0.5
     container_name: xiaozhi-backend
     ports:
       - "8081:8080"        # 后端管理服务 端口 映射至宿主机 28080
@@ -74,7 +74,7 @@ services:
 
   # 前端管理服务
   frontend:
-    image: docker.jsdelivr.fyi/hackers365/xiaozhi_manager_frontend:0.5
+    image: hackers365/xiaozhi_manager_frontend:0.5
     container_name: xiaozhi-frontend
     ports:
       - "8080:80"           # 前端管理服务 端口 映射至宿主机 18080
