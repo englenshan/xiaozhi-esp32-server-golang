@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +15,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/scroot/music-sd/pkg/netease"
+	"github.com/scroot/music-sd/pkg/qq"
 )
 
 type ToolName string
@@ -24,7 +24,8 @@ type ToolName string
 const (
 	STREAM_DONE_FLAG = "[DONE]"
 
-	MUSIC_PLAYER   ToolName = "musicPlayer"
+	MUSIC_PLAYER ToolName = "musicPlayer"
+	// INTERNET_MUSIC_PLAYER ToolName = "internetMusicPlayer"
 	VOLUME_CONTROL ToolName = "set_volume"
 )
 
@@ -236,13 +237,6 @@ func main() {
 	}
 }
 
-// 音乐搜索API响应结构
-type MusicSearchResponse struct {
-	Data  []MusicItem `json:"data"`
-	Code  int         `json:"code"`
-	Error string      `json:"error"`
-}
-
 type MusicItem struct {
 	Type   string `json:"type"`
 	Link   string `json:"link"`
@@ -272,80 +266,35 @@ func getMusicAudioData(musicName string) ([]byte, string, string, error) {
 	return body, realMusicName, musicUrl, nil
 }
 
+// title ,  url, error
 func GetMusicUrlByName(musicName string) (string, string, error) {
-	client := &http.Client{}
 
-	// 构建请求体
-	data := fmt.Sprintf("input=%s&filter=name&type=migu&page=1",
-		url.QueryEscape(musicName))
+	// 这里可以根据音乐名称获取音乐URL
+	// 目前简化实现，假设musicName就是URL或者从配置中获取
+	musicList := netease.Search(musicName)
+	musicList = append(musicList, qq.Search(musicName)...)
 
-	req, err := http.NewRequest("POST", "https://music.txqq.pro/",
-		strings.NewReader(data))
-	if err != nil {
-		return "", "", fmt.Errorf("创建请求失败: %v", err)
+	if len(musicList) <= 0 {
+		return "", "", fmt.Errorf("没有找到音乐")
 	}
+	m := musicList[0]
+	m.ParseMusic()
 
-	// 设置请求头，模拟浏览器请求
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("Origin", "https://music.txqq.pro")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Referer", "https://music.txqq.pro/")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("sec-ch-ua", `"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	return m.Name, m.Url, nil
 
-	// 设置超时
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
+	// rc, err := m.ReadCloser()
+	// if err != nil {
+	// 	return "", "", fmt.Errorf("获取音乐数据失败: %v", err)
+	// }
+	// defer rc.Close()
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("API请求失败: %v", err)
-	}
-	defer resp.Body.Close()
+	// audioData, err := io.ReadAll(rc)
+	// if err != nil {
+	// 	return nil, "", fmt.Errorf("读取响应失败: %v", err)
+	// }
+	// log.Infof("获取音乐 %s 数据成功, 音频数据长度: %d", m.Name, len(audioData))
+	// return audioData, m.Name, nil
 
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("API请求失败，状态码: %d", resp.StatusCode)
-	}
-
-	// 解析响应
-	var searchResp MusicSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
-		return "", "", fmt.Errorf("解析响应失败: %v", err)
-	}
-
-	if searchResp.Code != 200 {
-		return "", "", fmt.Errorf("API返回错误: %s", searchResp.Error)
-	}
-
-	if len(searchResp.Data) == 0 {
-		return "", "", fmt.Errorf("未找到音乐: %s", musicName)
-	}
-
-	// 遍历数组，找到第一个URL不为空的音乐项
-	var musicItem *MusicItem
-	for i := range searchResp.Data {
-		if searchResp.Data[i].URL != "" {
-			musicItem = &searchResp.Data[i]
-			break
-		}
-	}
-
-	if musicItem == nil {
-		return "", "", fmt.Errorf("未找到有效的音乐链接: %s", musicName)
-	}
-
-	return musicItem.Title, musicItem.URL, nil
 }
 
 func GetMusicDataByUrl(musicUrl string, start, end int) ([]byte, error) {

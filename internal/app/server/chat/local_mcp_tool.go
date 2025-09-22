@@ -47,12 +47,12 @@ func InitChatLocalMCPTools() {
 			Params:      struct{}{},
 			Handle:      clearConversationHistoryHandler,
 		},
-		"play_music": {
+		/*"play_music": {
 			Name:        "play_music",
 			Description: "当用户想听歌、无聊时、想放空大脑时使用，用于播放指定名称的音乐，当用户想随便听一首音乐时请推荐出具体的歌曲名称，当有多个音乐播放工具时优先使用此工具，**此工具调用耗时较长，需要先返回友好的过渡性提示语**",
 			Params:      PlayMusicParams{},
 			Handle:      playMusicHandler,
-		},
+		},*/
 	}
 
 	for toolName, localTool := range localTools {
