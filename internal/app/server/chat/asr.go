@@ -89,14 +89,25 @@ func (a *ASRManager) ProcessVadAudio(ctx context.Context, onClose func()) {
 							continue
 						}
 					}
+					// 确保 VadProvider 已正确初始化后再使用
+					if state.VadProvider == nil {
+						log.Errorf("VAD 提供者初始化失败，VadProvider 仍为 nil")
+						continue
+					}
 					//decode opus to pcm
 					state.AsrAudioBuffer.AddAsrAudioData(pcmData)
 
 					if state.AsrAudioBuffer.GetAsrDataSize() >= vadNeedGetCount*state.AsrAudioBuffer.PcmFrameSize {
 						//如果要进行vad, 至少要取60ms的音频数据
 						vadPcmData = state.AsrAudioBuffer.GetAsrData(vadNeedGetCount)
-						state.VadProvider.Reset()
-						haveVoice, err = state.VadProvider.IsVADExt(vadPcmData, audioFormat.SampleRate, frameSize)
+						// 确保 VadProvider 不为 nil 后再调用 Reset()
+						if state.VadProvider != nil {
+							state.VadProvider.Reset()
+							haveVoice, err = state.VadProvider.IsVADExt(vadPcmData, audioFormat.SampleRate, frameSize)
+						} else {
+							log.Errorf("VAD 提供者为 nil，无法进行 VAD 检测")
+							continue
+						}
 
 						if err != nil {
 							log.Errorf("processAsrAudio VAD检测失败: %v", err)

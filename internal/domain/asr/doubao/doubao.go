@@ -81,26 +81,29 @@ func (d *DoubaoV2ASR) StreamingRecognize(ctx context.Context, audioStream <-chan
 	err = c.SendFullClientRequest()
 	if err != nil {
 		log.Errorf("doubao asr failed to send full request: %v", err)
+		c.Close() // 确保连接被关闭
 		return nil, fmt.Errorf("send full request err: %w", err)
 	}
 
 	go func() {
-		err = c.StartAudioStream(ctx, audioStream, doubaoResultChan)
+		if err := c.StartAudioStream(ctx, audioStream, doubaoResultChan); err != nil {
+			log.Errorf("豆包ASR音频流发送失败: %v", err)
+		}
 	}()
 
-	// 启动音频发送goroutine
-	//go d.forwardStreamAudio(ctx, audioStream, resultChan)
-
-	// 启动结果接收goroutine
-	go d.receiveStreamResults(ctx, resultChan, doubaoResultChan)
+	// 启动结果接收goroutine，传递client用于清理
+	go d.receiveStreamResults(ctx, resultChan, doubaoResultChan, c)
 
 	return resultChan, nil
 }
 
 // receiveStreamResults 接收流式识别结果
-func (d *DoubaoV2ASR) receiveStreamResults(ctx context.Context, resultChan chan types.StreamingResult, asrResponseChan chan *response.AsrResponse) {
+func (d *DoubaoV2ASR) receiveStreamResults(ctx context.Context, resultChan chan types.StreamingResult, asrResponseChan chan *response.AsrResponse, client *client.AsrWsClient) {
 	defer func() {
 		close(resultChan)
+		if client != nil {
+			client.Close() // 确保WebSocket连接被关闭
+		}
 	}()
 	for {
 		select {
@@ -112,11 +115,17 @@ func (d *DoubaoV2ASR) receiveStreamResults(ctx context.Context, resultChan chan 
 				log.Debugf("receiveStreamResults asrResponseChan 已关闭")
 				return
 			}
-			if result.IsLastPackage {
+
+			// 处理所有结果，包括中间结果和最终结果
+			if result.PayloadMsg != nil && result.PayloadMsg.Result.Text != "" {
 				resultChan <- types.StreamingResult{
 					Text:    result.PayloadMsg.Result.Text,
-					IsFinal: true,
+					IsFinal: result.IsLastPackage,
 				}
+			}
+
+			// 如果是最终结果，结束处理
+			if result.IsLastPackage {
 				return
 			}
 		}
